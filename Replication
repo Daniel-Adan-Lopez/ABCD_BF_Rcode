@@ -1,0 +1,675 @@
+#Updated 03/22/2021
+
+#BREASTFEEDING DURATION IS ASSOCIATED WITH DOMAIN-SPECIFIC IMPROVEMENTS IN COGNITIVE PERFORMANCE IN 9-10-YEAR-OLD CHILDREN
+
+#R-code for the purpose of replicating results
+
+#(1) Determine whether being breastfed is associated with an improvement in neurocognitive performance
+#(2) Evaluate whether there is a differential impact according to cognitive domain (i.e. General Ability, 
+#Executive Function, Learning/Memory) using Principal Component Analysis to create "summary" scores for each domain
+#(3) PCA scores will be the dependent variable in each model. Independent variable of interest is breastfeeding duration.
+#(4) Propensity score weighting to create a balanced distribution of possible confounders in the different treatment levels
+#(i.e. 0 months, 1 to 6 months, 7 to 12 months, more than 12 months)
+#(5) Using the inverse probability of treatment weights to determine the "effect" of treatment 
+#(6) Sensitivity analysis for unmeasured confounding 
+
+
+#Dataset: The dataset being used is the 2.0.1 release. For this analysis, only children that attended the baseline 
+#visit with a biological MOTHER will be included. This is to limit the chance of measurement error related to 
+#different variables (e.g. breastfeeding duration, substance use during pregnancy, birth weight of child, substance use
+#during pregnancy)
+#There were 10,131 children that attended the baseline with their biological mother (or about 85-86% of the full sample). 
+#In addition, children missing a neurocognitive test and breastfeeding information were excluded.  
+#Final sample size was 9116 out of 10131 (90.9%).
+
+#Selection of variables: Review of the literature was conducted to find variables that are potentially confounding the 
+#association between breastfeeding and neurocognitive performance OR associated with neurocognitive performance but not
+#breastfeeding (precision variables). Recommendations from Brookhart, M. Alan, et al. "Variable selection for 
+#propensity score models." American journal of epidemiology 163.12 (2006): 1149-1156.
+
+#=================================
+#==      required packages      ==
+#=================================
+library(twang) #for the multinomial propensity score
+library(survey) #for the extraction of weights based on the propensity score model
+library(tidyverse) #recoding of variables (e.g., breastfeeding, maternal education)
+library(sensemakr) #for the sensitivity analysis of unmeasured confounding
+library(mice)  #for the imputation of the neurocognitive data in the sensitivity analysis
+library(psych) #for the PCA
+library(gamm4)
+#====================
+#==      data      ==
+#====================
+saveRDS(ABCDfull10, file="ABCDfull10.rds") # data file includes 9116 participants after removal of those 
+#that did not attend baseline with biological mother, were missing neurocognitive data, and missing data
+#on breastfeeding exposure 
+
+
+#===========================================
+#== Descriptive Analysis and Data Prep======
+#===========================================
+
+#creation of a categorical variable for 0 months, 1-6 months, 7-12, and more than 12 months breastfed
+ABCDfull10$bfcat4C <- cut(ABCDfull10$monthsbreastfed, breaks= c(0, 1, 7, 13, Inf), labels = c("None", "OnetoSix", "SeventoTwelve" , "MorethanTwelve"), right=FALSE)
+
+#certain variables included in the propensity score model had to be recoded to make sure missing data was being labeled correctly prior to being
+#entered into the PS estimation.  
+
+#otherwise you get NA as its own level rather than being treated as missing data. GBM can account for missing data.
+
+#recoding maternal education
+ABCDfull10$mother_educ <- recode(demo_prnt_ed_v2b, '10th grade'= "< HS Diploma", '11th grade' = "< HS Diploma", '12th grade, no diploma' = "< HS Diploma", 
+                              '1st grade' = "< HS Diploma", '2nd grade' = "< HS Diploma", '3rd grade' = "< HS Diploma", '4th grade' = "< HS Diploma", '5th grade' = "< HS Diploma", 
+                              '6th grade' = "< HS Diploma", '7th grade' = "< HS Diploma", '8th grade' = "< HS Diploma", '9th grade' = "< HS Diploma", "Associate degree: Academic Program" = "Some College",
+                              "Associate degree: Occupational, Technical, or Vocational" = "Some College", "Bachelor's degree (ex. BA, AB, BS, BBS)" = 'Bachelor', "Doctoral degree (ex. PhD, EdD)" = "Post Graduate Degree",
+                              "GED or equivalent" = "HS Diploma/GED", "High school graduate" = "HS Diploma/GED", "Master's degree (ex. MA, MS, MEng, MEd, MBA)" = "Post Graduate Degree", "Professional School degree (ex. MD, DDS, DVN, JD)" = "Post Graduate Degree",
+                              "Refused to answer" = "Refused to answer", "Some college, no degree" = "Some College")
+
+#===========================================
+#===== Principal Component Analysis   ======
+#===========================================
+library(psych)
+
+x <- data.frame(src_subject_id, pea_ravlt_ld_trial_vii_tc, pea_ravlt_sd_trial_vi_tc, 
+                nihtbx_flanker_uncorrected, nihtbx_pattern_uncorrected, nihtbx_list_uncorrected, 
+                nihtbx_cardsort_uncorrected, nihtbx_picture_uncorrected, 
+                nihtbx_reading_uncorrected, nihtbx_picvocab_uncorrected, pea_wiscv_tss, 
+                lmt_scr_perc_correct, pea_ravlt_sd_trial_i_tc, pea_ravlt_sd_trial_ii_tc, pea_ravlt_sd_trial_iii_tc, 
+                pea_ravlt_sd_trial_iv_tc, pea_ravlt_sd_trial_v_tc)
+
+#RAVLTSD is the combined avg score of the first five trials.
+x$RAVLTSD <- (pea_ravlt_sd_trial_i_tc + pea_ravlt_sd_trial_ii_tc + pea_ravlt_sd_trial_iii_tc + pea_ravlt_sd_trial_iv_tc + pea_ravlt_sd_trial_v_tc
+)/5
+
+
+mydata2 <- x[, c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 18)]
+#gives me a dataframe with only the tests I want along with subject id. I don't want RAVLT trial 1 through 5 because they are already included
+#in RAVLTSD. 
+
+neuro <- mydata2[ , 2:12]
+
+#methods for the PCA with varimax-rotation taken from Thompson, 2018 article.
+#extraction of three components after examination of a 4 factor structure placed Cash Choice Task separate (i.e., it loaded into its own component). #as a 
+#result, Cash Choice Task was removed.
+#Three factor structure chosen after examination of eigenvalues and scree plot.  
+
+
+pcapsych1 <- principal(neuro, 3, rotate="varimax")
+pcapsych1
+#                             RC1  RC3  RC2   h2   u2 com
+#pea_ravlt_ld_trial_vii_tc   0.89 0.18 0.08 0.83 0.17 1.1
+#pea_ravlt_sd_trial_vi_tc    0.89 0.17 0.09 0.82 0.18 1.1
+#nihtbx_flanker_uncorrected  0.08 0.25 0.71 0.57 0.43 1.3
+#nihtbx_pattern_uncorrected  0.11 0.03 0.80 0.66 0.34 1.0
+#nihtbx_list_uncorrected     0.29 0.60 0.20 0.48 0.52 1.7
+#nihtbx_cardsort_uncorrected 0.19 0.25 0.71 0.61 0.39 1.4
+#nihtbx_picture_uncorrected  0.52 0.25 0.21 0.38 0.62 1.8
+#nihtbx_reading_uncorrected  0.17 0.75 0.13 0.61 0.39 1.2
+#nihtbx_picvocab_uncorrected 0.18 0.75 0.10 0.60 0.40 1.2
+#pea_wiscv_tss               0.21 0.64 0.08 0.46 0.54 1.2
+#lmt_scr_perc_correct        0.08 0.52 0.27 0.35 0.65 1.6
+#RAVLTSD                     0.83 0.27 0.14 0.77 0.23 1.3
+#                       RC1  RC3  RC2
+#SS loadings           2.78 2.48 1.87
+#Proportion Var        0.23 0.21 0.16
+#Cumulative Var        0.23 0.44 0.60
+#Proportion Explained  0.39 0.35 0.26
+#Cumulative Proportion 0.39 0.74 1.00
+#RC1 aligns with Memory, RC3 with General Ability, RC2 with Executive Function. 
+
+pcapsych1$loadings
+plot(pcapsych1)
+summary(pcapsych1$scores)
+pcapsych1$values
+#eigenvalues with cash choice task included
+#[1] 4.5150232 1.4768760 1.1221600 0.9999384 0.7611532
+
+#eigenvalues with cash choice removed
+#[1] 4.5146406 1.4745772 1.1129318 0.769722
+
+#eigenvalues less than 1 do not add explanatory value
+
+#extraction of the scores from the varimax-rotated PCA
+y <- pcapsych1$scores
+#binding the scores with the ABCDfull10 dataset
+neuro <- cbind(neuro,y)
+ABCDneuro <- cbind(ABCDfull10, neuro)
+#results from dataset with incomplete neuro removed
+#summary(ABCDfull10$RC1)
+#Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+#-3.97375 -0.68787  0.05736  0.00000  0.72782  2.75241 
+#summary(ABCDfull10$RC2)
+#Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+#-4.14119 -0.64159  0.04228  0.00000  0.68320  3.36066 
+#summary(ABCDfull10$RC3)
+#Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+#-3.75266 -0.65433  0.01507  0.00000  0.65945  3.68486
+
+
+#====================
+#== PS estimation  ==
+#====================
+#Create a vector of the covariates that will be balanced by using propensity score methods
+
+
+#for ABCDfull10
+covariatenames <- c(  
+                      "gender", #gender of child
+                      "totalwt", #birth weight of child in ounces
+                      "race_ethnicity",   #white,black,hispanic,asian,other and 9 missing
+                      "household_income_4level", #<50,000, 50-100k, 100k to 200k, more than 200k
+                      "mother_educ", #biological mother's educational attainment
+                      "married_bl",  #marital status of the mother
+                      "tobaccop",   #whether tobacco was used during pregnancy
+                      "alcoholp", #whether there was alcohol consumed during pregnancy
+                      "weeksprem", #how many weeks premature the child was born
+                      "devhx_3_age_at_birth_mother_p", #mother's age at birth of child
+                      "pregnancyplanned", #whether the pregnancy was planned 
+                      "interview_age", #interview age of child at baseline in months
+                      "rel_relationship", #clustering info- singletons, twins, triplets, siblings in the ABCD study. Relationship of ppt in his family
+                      "Csection", #Was he/she born by Caesarian section?
+                      "bluebirth",
+                      "HeartBeat",
+                      "Oxygen",
+                      "devhx_15_days_incubator_p",
+                      "pvitamins", #prenatal vitamins
+                      "Diabetic",
+                      "srpf_y_ss_ses", #school risk protective factors
+                      "fes_y_ss_fc") #youth reported family conflict score 
+
+
+#This creates the formula for the propensity score:
+psFormula <- paste(covariatenames, collapse="+")
+psFormula <- formula(paste("bfcat4C~",psFormula, sep=""))
+print(psFormula)
+#bfcat4C ~ weeksprem + gender + totalwt + race_ethnicity + household_income_4level + 
+#  mother_educ + married_bl + tobaccop + alcoholp + devhx_3_age_at_birth_mother_p + 
+#  pregnancyplanned + interview_age.x + rel_relationship.x + 
+#  Csection + bluebirth + HeartBeat + Oxygen + devhx_15_days_incubator_p + 
+#  pvitamins + Diabetic + srpf_y_ss_ses + fes_y_ss_fc
+
+##==============================================================================
+#== PS estimation with multiple treatments Using Generalized Boosted Modeling ==
+#===============================================================================
+
+library(twang)
+
+#the algorithm takes into account weights to estimate the ATE. Also sampling weights are taken into account.
+
+#the below was to make a comparison with the different stopping methods to see which to choose for final model.
+#we want a stopping method that will maximize balance along with effective sample size. 
+
+#acs raked propensity score included with the dataset. 
+
+boost.ps6 <- mnps(psFormula, data=ABCDfull10, estimand="ATE", verbose=FALSE, #the estimand can either be ATE or ATT
+                  stop.method=c("ks.mean", "ks.max", "es.mean", "es.max"), n.trees=25000, interaction.depth=4, 
+                  sampw=ABCDfull10$acs_raked_propensity_score)
+
+#ks.mean stopping method was selected due to having the most balance and effective sample size. 
+
+boost.ps14 <- mnps(psFormula, data=ABCDfull10, estimand="ATE", verbose=FALSE, #the estimand can either be ATE or ATT
+                   stop.method=c("ks.mean"), n.trees=30000, interaction.depth=4, shrinkage=0.001, bag.fraction=.5, 
+                   sampw=ABCDfull10$acs_raked_propensity_score)
+
+#visual inspection of convergence. 
+plot(boost.ps14, plots=1)
+dev.off()
+
+#replace plots= with 2, 3 , 4, or 5 for different types of plots . 
+#more balance diagnostics
+
+plot(boost.ps14, plots=2)
+dev.off()
+
+#the overlap does not appear to be good between 0 months and those who were breastfed 13 months or more. 
+#According to the literature this may be a concern but after the modeling the balance between 0 and 12 
+#or more months was very good suggesting that the overlap was sufficient prior to estimation. 
+
+#After weighting the max ASMD decreases for all pretreatment covariates except three variables.
+ 
+plot(boost.ps14, plots=3)
+dev.off()
+
+#display of the t-test or chi-square statistic pairwise minimum p-values
+#all the pairwise minimum p-values increased after propensity score weighting. 
+
+plot(boost.ps14, plots=4)
+dev.off()
+
+plot(boost.ps14, plots=5)
+dev.off()
+
+
+plot = plot(boost.ps14, plots=2, subset="ks.mean")
+
+#results show that the unweighted balance was extremely poor, with many having a n absolute standardized mean difference (ASMD) 
+#above .2.
+#ASMD is also referred to as the absolute standardized bias or the effect size and KS statistic. 
+#None of the covariates have an ASMD that surpass .14 after balancing. Prior to balancing the highest was 1.00.
+
+#for each pretreatment variable, the maximum ASMD has decreased and min. p values increased after applying weights from either stop method
+#note that mothers age is still significantly different across the treatment levels even after applying the weights. 
+
+#still significant although they have moved in the right direction after PS weighting. 
+
+summary(boost.ps14)
+
+balance.boost.ps <- bal.table(boost.ps14, digits=2)
+
+summary.balance.boost <- aggregate(std.eff.sz~tmt1+tmt2+stop.method, data=balance.boost.ps, FUN=max)
+
+balance.above.0.1.gbm <-subset(balance.boost.ps,(std.eff.sz>0.10 & stop.method == "ks.mean" ))
+
+balance.above.0.1.gbm
+
+#boost.ps14
+#Summary of pairwise comparisons:
+#  max.std.eff.sz         min.p     max.ks   min.ks.pval stop.method
+#1      0.9996332 4.594366e-280 0.33766843 -4.440892e-15         unw
+#2      0.1308389 9.827768e-271 0.04275954  3.555936e-02     ks.mean
+
+
+
+#Sample sizes and effective sample sizes:
+#  treatment    n ESS:ks.mean
+#1           None 1875    1053.437
+#2       OnetoSix 3241    2572.690
+#3  SeventoTwelve 2198    1345.292
+#4 MorethanTwelve 1802    1020.535
+
+
+
+#tmt1           tmt2                  var mean1 mean2 pop.sd std.eff.sz   p   ks ks.pval stop.method
+#586 None  SeventoTwelve           tobaccop:N  0.94  0.96   0.19       0.12 NaN 0.02     NaN     ks.mean
+#587 None  SeventoTwelve           tobaccop:Y  0.06  0.04   0.19       0.11 NaN 0.02     NaN     ks.mean
+#642 None MorethanTwelve race_ethnicity:Black  0.14  0.11   0.28       0.13 NaN 0.04     NaN     ks.mean
+
+#only two variables had an ASMD greater than .10. 
+
+
+##==================================================
+#== Obtaining Weights Using the Propensity Scores ==
+#===================================================
+
+library(survey)
+
+#calculate the IPTW from the propensity scores obtained with generalized boosting,
+#and multiply by the sampling weights
+
+
+
+ABCDfull10$finalWeightATE6 <- get.weights(boost.ps14, stop.method = "ks.mean",   estimand = "ATE",
+                                          withSampW = TRUE)
+
+
+
+ABCDfull10$finalWeightATE6 <- get.weights(boost.ps14, stop.method = "ks.mean",   estimand = "ATE",
+                                          withSampW = TRUE)
+
+ABCDfull10$finalWeightATE6 <- with(ABCDfull10,finalWeightATE6 /
+                                     mean(finalWeightATE6 ))
+
+with(ABCDfull10, by(finalWeightATE6,bfcat4C,summary))
+summary(ABCDfull10$finalWeightATE6)
+
+#check distribution of weights to look for outliers. None of these weights seem too 
+#extreme although the None category is a bit high. 
+
+with(ABCDfull10, by(finalWeightATE6,bfcat4C,summary))
+summary(ABCDfull10$finalWeightATE6)
+
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.09741 0.49671 0.74451 1.00000 1.17980 8.79609
+
+
+#boost.ps14
+#bfcat4C: None
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.1183  0.4595  0.8200  1.1717  1.5141  8.7961 
+#----------------------------------------------------------------------------------------------- 
+#  bfcat4C: OnetoSix
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.0974  0.4630  0.6634  0.7335  0.9360  2.6300 
+#----------------------------------------------------------------------------------------------- 
+#  bfcat4C: SeventoTwelve
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.1592  0.5189  0.7741  1.0366  1.2575  8.1576 
+#----------------------------------------------------------------------------------------------- 
+#  bfcat4C: MorethanTwelve
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.1383  0.5726  0.8821  1.2559  1.4950  8.6108 
+
+#analysis with truncated weights
+ABCDfull10$weightATETruncated <- with(ABCDfull10, ifelse(finalWeightATE6 > quantile(finalWeightATE6, 0.99),
+                                                         quantile(finalWeightATE6, 0.99), finalWeightATE6))
+
+#summary of the truncated weights
+with(ABCDfull10, by(weightATETruncated, bfcat4C, summary))
+summary(ABCDfull10$weightATETruncated)
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.09741 0.49671 0.74451 0.98832 1.17980 4.43876 
+
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.1183  0.4595  0.8200  1.1524  1.5141  4.4388 
+#------------------------------------------------------------------------------------------------------ 
+#  bfcat4C: OnetoSix
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.0974  0.4630  0.6634  0.7335  0.9360  2.6300 
+#------------------------------------------------------------------------------------------------------ 
+#  bfcat4C: SeventoTwelve
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.1592  0.5189  0.7741  1.0279  1.2575  4.4388 
+#------------------------------------------------------------------------------------------------------ 
+#  bfcat4C: MorethanTwelve
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.1383  0.5726  0.8821  1.2275  1.4950  4.4388 
+
+#shows that those extreme weights constitute a very small percentage of the overall sample size 
+#effect estimates were greater with the truncated weights. 
+
+
+##=====================================================================================
+#== Using Survey Package to Estimate ATE (Average Treatment Effect Using GBM Weights ==
+#======================================================================================
+
+#set up the survey design
+
+
+design.IPTW <- svydesign(ids = ~1, weights = ~finalWeightATE6, data = ABCDfull10)
+#create replicate weights for bootstrapping. Bootstrapping is used to obtain standard errors that account for clustering.
+design.IPTW.boot <- as.svrepdesign(design.IPTW, type=c("bootstrap"),replicates=1000)
+
+#The below is used to estimate the means for each treatment group.
+weightedProportions <-svyby(formula=~RC3, by=~bfcat4C, design=design.IPTW.boot, FUN=svymean, covmat=TRUE)
+
+print(weightedProportions)
+
+
+##======================================================
+#==Pairwise Comparison of the Average Treatment Effect==
+#=======================================================
+
+pairwise.ATE <- svycontrast(weightedProportions, 
+                            contrasts=list(
+                              None.OnetoSix= c("None"=-1,"OnetoSix"=1), 
+                              OnetoSix.SeventoTwelve=c("OnetoSix"=-1,"SeventoTwelve"=1), 
+                              None.SeventoTwelve=c("None"=-1,"SeventoTwelve"=1),
+                              None.MorethanTwelve=c("None"=-1,"MorethanTwelve"=1),
+                              OnetoSix.MorethanTwelve=c("OnetoSix"=-1,"MorethanTwelve"=1),
+                              SeventoTwelve.MorethanTwelve=c("SeventoTwelve"=-1,"MorethanTwelve"=1)))
+pairwise.ATE
+
+
+#===============================================
+#==Estimating Treatment Effect with Regression==
+#===============================================
+#at this point we do a regression analysis because there were a couple of variables that remained 
+#imbalanced (race/ethnicity and tobacco use during pregnancy). Additional adjustment will minimize
+#bias due to this remaining imbalance. 
+ 
+ #Factor3 General Ability
+#Regression without additional adjustment.
+glm1 <- svyglm(RC3 ~ as.factor(bfcat4C), design=design.IPTW.boot)
+summary(glm1)
+#ks.mean RC3
+#Coefficients:
+#                             Estimate Std. Error t value Pr(>|t|)    
+#(Intercept)                      -0.19642    0.03150  -6.235 6.66e-10 ***
+#  as.factor(bfcat4C)OnetoSix        0.11505    0.03733   3.082  0.00211 ** 
+#  as.factor(bfcat4C)SeventoTwelve   0.24664    0.04168   5.918 4.47e-09 ***
+#  as.factor(bfcat4C)MorethanTwelve  0.32802    0.04588   7.150 1.68e-12 ***
+
+#                                   2.5 %     97.5 %
+#  (Intercept)                      -0.25816809 -0.1346790
+#as.factor(bfcat4C)OnetoSix        0.04187734  0.1882201
+#as.factor(bfcat4C)SeventoTwelve   0.16495955  0.3283230
+#as.factor(bfcat4C)MorethanTwelve  0.23809821  0.4179412
+
+#doubly robust estimate using only covariates that had a standardized effect size greater than .10 suggesting some lack of balance
+#These are the results with the two variables that showed some imbalance after the weighting
+glm4 <- svyglm(RC3 ~ as.factor(bfcat4C)+  
+                 race_ethnicity + tobaccop
+               , design=design.IPTW.boot)
+
+
+summary(glm4)
+#                                  Estimate Std. Error t value Pr(>|t|)    
+#as.factor(bfcat4C)OnetoSix        0.10935    0.03568   3.065  0.00224 ** 
+#  as.factor(bfcat4C)SeventoTwelve   0.22435    0.03935   5.702 1.57e-08 ***
+#  as.factor(bfcat4C)MorethanTwelve  0.30095    0.04285   7.023 4.04e-12 ***
+
+#95% CI's with bootstrapping
+#as.factor(bfcat4C)OnetoSix        0.03941867  0.17928018
+#as.factor(bfcat4C)SeventoTwelve   0.14722804  0.30146964
+#as.factor(bfcat4C)MorethanTwelve  0.21695775  0.38493994
+
+
+
+#Now doing the same for the other two factors using regression:
+#Factor 2  Memory
+glm2 <- svyglm(RC2 ~ as.factor(bfcat4C), design=design.IPTW.boot)
+summary(glm2)
+
+#as.factor(bfcat4C)OnetoSix       -0.028489   0.039560  -0.720    0.472
+#as.factor(bfcat4C)SeventoTwelve   0.005877   0.042018   0.140    0.889
+#as.factor(bfcat4C)MorethanTwelve  0.002910   0.045454   0.064    0.949
+
+confint(glm2, level=.95, method=c("Wald"))
+
+#as.factor(bfcat4C)OnetoSix       -0.10602491 0.04904661
+#as.factor(bfcat4C)SeventoTwelve  -0.07647615 0.08822962
+#as.factor(bfcat4C)MorethanTwelve -0.08617876 0.09199909
+
+
+#None of the results were significant here and there is no overall trend towards improved Factor2
+#scores and breastfeeding duration.
+
+
+
+#Factor 2  Memory with additional adjustment for imbalanced covariates
+
+glm5 <- svyglm(RC2 ~ as.factor(bfcat4C)+  
+                 race_ethnicity+
+                 tobaccop 
+               , design=design.IPTW.boot)
+
+
+summary(glm5)
+
+
+#as.factor(bfcat4C)OnetoSix       -0.031141   0.039167  -0.795    0.427    
+#as.factor(bfcat4C)SeventoTwelve  -0.001271   0.041838  -0.030    0.976    
+#as.factor(bfcat4C)MorethanTwelve -0.008476   0.045157  -0.188    0.851 
+
+confint(glm5, method=c("Wald"))
+#as.factor(bfcat4C)OnetoSix       -0.10790712  0.04562558
+#as.factor(bfcat4C)SeventoTwelve  -0.08327211  0.08073094
+#as.factor(bfcat4C)MorethanTwelve -0.09698264  0.08002983
+
+
+#Factor 3 Executive Function
+glm3 <- svyglm(RC1 ~ as.factor(bfcat4C), design=design.IPTW.boot)
+summary(glm3)
+#as.factor(bfcat4C)OnetoSix       -0.015950   0.035537  -0.449    0.654
+#as.factor(bfcat4C)SeventoTwelve  -0.001353   0.038958  -0.035    0.972
+#as.factor(bfcat4C)MorethanTwelve -0.017345   0.042623  -0.407    0.684
+
+confint(glm3, level=.95, method=c("Wald"))
+#as.factor(bfcat4C)OnetoSix       -0.08560109 0.05370081
+#as.factor(bfcat4C)SeventoTwelve  -0.07770923 0.07500362
+#as.factor(bfcat4C)MorethanTwelve -0.10088478 0.06619431
+######
+
+
+#doubly robust estimation has been suggested as good practice to ensure the least bias possible.
+#Mccaffrey just includes those covariates that had an imbalance even after the GBM.  
+
+#Factor3 Executive Function
+
+glm6 <- svyglm(RC1 ~ as.factor(bfcat4C)+  
+                 race_ethnicity+
+                 tobaccop 
+               , design=design.IPTW.boot)
+
+summary(glm6)
+glm6
+
+#as.factor(bfcat4C)OnetoSix       -0.02122    0.03530  -0.601  0.54789    
+#as.factor(bfcat4C)SeventoTwelve  -0.01754    0.03841  -0.457  0.64794    
+#as.factor(bfcat4C)MorethanTwelve -0.03627    0.04271  -0.849  0.39592
+
+confint(glm6, method=c("Wald"))
+
+#as.factor(bfcat4C)OnetoSix       -0.09040193  0.04796469
+#as.factor(bfcat4C)SeventoTwelve  -0.09282262  0.05773518
+#as.factor(bfcat4C)MorethanTwelve -0.11998097  0.04743570
+
+#========================
+#==Sensitivity Analysis==
+#========================
+#here we are using OLS to get a rough estimate of the strength of unmeasured confounding needed to explain away 
+#our conclusion that General Ability was significantly associated with breastfeeding duration. 
+
+library(sensemakr)
+
+#notes
+
+#the partial R2 describes how much of the residual variance of the outcome (after partialing
+#out the other covariates) a covariate explains. 
+#Considering an unobserved confounder that explains 100% of the residual variance of the outcome,
+#the partial R2 describes how strongly associated with the treatment this unobserved confounder
+#would need to be in order to explain away the estimated effect. 
+#the partial (Cohen's) f2 is a common measure of effect size (a transformation of the partial R2) that
+#can also be used directly for sensitivity analysis using a bias factor table. 
+
+#A linear model is required for sensemakr. GLM will also work. Currently there is no support for multilevel model. 
+#The weight used is just the ACS weight. Can also consider doing it with the PS estimation weights but I believe that requires the 
+#survey specification otherwise it is not appropriate to use. 
+#As a result this is a rough estimation because this model will overestimate the strength of the effect estimate.
+#"srpf_y_ss_ses", #school risk protective factors
+#"fes_y_ss_fc") #youth reported family conflict score
+
+MODELM <- lm(RC3 ~ bfcat4C+weeksprem + gender +  race_ethnicity + 
+               household_income_4level + mother_educ + married_bl + tobaccop + 
+               alcoholp + devhx_3_age_at_birth_mother_p + pregnancyplanned + 
+               interview_age.x + rel_relationship.x + Csection + bluebirth + 
+               HeartBeat + Oxygen + devhx_15_days_incubator_p + 
+               pvitamins + Diabetic+srpf_y_ss_ses+fes_y_ss_fc, 
+             weight=ABCDfull10$acs_raked_propensity_score, data=ABCDfull10)
+
+summary(MODELM)
+
+#bfcat4COnetoSix                           0.126669   0.027549   4.598 4.34e-06 ***
+#  bfcat4CSeventoTwelve                      0.213833   0.031729   6.739 1.71e-11 ***
+#  bfcat4CMorethanTwelve                     0.306615   0.033322   9.202  < 2e-16 ***
+confint(MODELM, method=c("Wald"))
+#bfcat4COnetoSix                           0.072664748  0.180673853
+#bfcat4CSeventoTwelve                      0.151635638  0.276030354
+#bfcat4CMorethanTwelve                     0.241294255  0.371935770
+
+#So that the categorical variable mother_educ can be used as the benchmark rather than recoding it to a numerical
+mother_educ_vars <- grep("mother_educ", names(coef(MODELM)), value = T)
+
+#By specifying the dummy variable for treatment level it can give a comparison of the level by 0 months of breastfeeding.
+#This is important because of the dose-response relationship between bf and Factor1.
+
+sensitivity <- sensemakr(MODELM, treatment = "bfcat4COnetoSix", benchmark_covariates = list(mother_educ = mother_educ_vars), kd = 1:3)
+
+
+sensitivity
+
+summary(sensitivity)
+
+plot(sensitivity, sensitivity.of = "estimate", lim=.15, lim.y=.15)
+
+plot(sensitivity, sensitivity.of = "t-value", lim=.15, lim.y=.15)
+
+plot(sensitivity, "extreme", lim=.08)
+
+ovb_minimal_reporting(sensitivity, format="latex") #format can be html or latex
+
+
+#Comparison of the other bf groups
+
+sensitivity <- sensemakr(MODELM, treatment = "bfcat4COnetoSix", benchmark_covariates = list(mother_educ = mother_educ_vars), kd = 1:3)
+sensitivity <- sensemakr(MODELM, treatment = "bfcat4SeventoTwelve", benchmark_covariates = list(mother_educ = mother_educ_vars), kd = 1:3)
+
+#interpretation
+#More than twelve and seven to twelve are robust to major unmeasured confounding. One to six is not. 
+
+#Additional sensitivity analysis using the full cohort without a PS model
+
+#sensitivity analysis 
+#How does it compare to using just a multilevel model with the same PS variables on the full cohort? 
+library(gamm4)
+MODEL1 <- gam(RC3 ~ bfcat4C+gender + race_ethnicity+ 
+                  household_income_4level + mother_educ+ married_bl + 
+                  devhx_3_age_at_birth_mother_p+fes_y_ss_fc+interview_age+
+                  devhx_8_alcohol_p+weeksprem+devhx_8_tobacco_p+totalwt+devhx_6_pregnancy_planned_p+
+                  rel_relationship+devhx_13_ceasarian_p + pvitamins+devhx_14f_oxygen_p+devhx_14b_slow_heart_beat_p+
+                  devhx_15_days_incubator_p+devhx_10i_diabetes_p+devhx_14a_blue_birth_p+srpf_y_ss_ses, 
+                random = ~ (1|abcd_site/rel_family_id), na.action=na.omit, weight=acs_raked_propensity_score, data=ABCD11875)
+
+summary(MODEL1$gam)
+summary(MODEL1$mer)
+summary(MODEL1)
+summary1 <- summary(MODEL1)
+summary1$p.table
+#General Ability
+#                                             Estimate Std. Error t value Pr(>|t|)         
+#bfcat4COnetoSix                             0.0927483  0.0239659   3.870 0.000110 ***
+#bfcat4CSeventoTwelve                        0.2017498  0.0278041   7.256 4.29e-13 ***
+#bfcat4CMorethanTwelve                       0.2909590  0.0291508   9.981  < 2e-16 ***
+
+#95% CI
+p_table <- data.frame(summary1$p.table)
+p_table <- within(p_table, {lci <- Estimate - qnorm(0.975) * Std..Error
+uci <- Estimate + qnorm(0.975) * Std..Error})
+p_table
+
+
+MODEL2 <- gam(RC2 ~ bfcat4C+gender + race_ethnicity+ 
+                  household_income_4level + mother_educ+ married_bl + 
+                  devhx_3_age_at_birth_mother_p+fes_y_ss_fc+interview_age+
+                  devhx_8_alcohol_p+weeksprem+devhx_8_tobacco_p+totalwt+devhx_6_pregnancy_planned_p+
+                  rel_relationship+devhx_13_ceasarian_p + pvitamins+devhx_14f_oxygen_p+devhx_14b_slow_heart_beat_p+
+                  devhx_15_days_incubator_p+devhx_10i_diabetes_p+devhx_14a_blue_birth_p+srpf_y_ss_ses, 
+                random = ~ (1|abcd_site/rel_family_id), na.action=na.omit, weight=acs_raked_propensity_score, data=ABCD11875)
+summary(MODEL2$gam)
+summary(MODEL2$mer)
+summary(MODEL2)
+summary2 <- summary(MODEL2)
+summary2$p.table
+#Executive Function
+#                                          Estimate Std. Error   t value Pr(>|t|)
+#bfcat4COnetoSix                           0.0039310  0.0272456   0.144 0.885282    
+#bfcat4CSeventoTwelve                      0.0461963  0.0316091   1.461 0.143914    
+#bfcat4CMorethanTwelve                     0.0233586  0.0331401   0.705 0.480924    
+
+p_table <- data.frame(summary2$p.table)
+p_table <- within(p_table, {lci <- Estimate - qnorm(0.975) * Std..Error
+uci <- Estimate + qnorm(0.975) * Std..Error})
+p_table
+
+
+MODEL3 <- gam(RC1 ~ bfcat4C+gender + race_ethnicity+ 
+                  household_income_4level + mother_educ+ married_bl + 
+                  devhx_3_age_at_birth_mother_p+fes_y_ss_fc+interview_age+
+                  devhx_8_alcohol_p+weeksprem+devhx_8_tobacco_p+totalwt+devhx_6_pregnancy_planned_p+
+                  rel_relationship+devhx_13_ceasarian_p + pvitamins+devhx_14f_oxygen_p+devhx_14b_slow_heart_beat_p+
+                  devhx_15_days_incubator_p+devhx_10i_diabetes_p+devhx_14a_blue_birth_p+srpf_y_ss_ses, 
+                random = ~ (1|abcd_site/rel_family_id), na.action=na.omit, weight=acs_raked_propensity_score, data=ABCD11875)
+summary(MODEL3$gam)
+summary(MODEL3$mer)
+summary <- summary(MODEL3)
+summary$p.table
+#Memory
+#                                           Estimate Std. Error t value Pr(>|t|)
+#bfcat4COnetoSix                          -0.0065048  0.0275306  -0.236 0.813224    
+#bfcat4CSeventoTwelve                     -0.0081790  0.0319397  -0.256 0.797899    
+#bfcat4CMorethanTwelve                    -0.0521535  0.0334867  -1.557 0.119400   
+
+p_table <- data.frame(summary$p.table)
+p_table <- within(p_table, {lci <- Estimate - qnorm(0.975) * Std..Error
+uci <- Estimate + qnorm(0.975) * Std..Error})
+p_table
